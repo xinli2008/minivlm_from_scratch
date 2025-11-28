@@ -123,6 +123,25 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     x = x.unsqueeze(2).expand(batch_size, n_heads, n_rep, seq_len, head_dim).contiguous().view(batch_size, n_heads * n_rep, seq_len, head_dim)
     return x
 
+def precompute_freqs_cos_sin(
+        dim: int,
+        max_position_embeddings: int,
+        rope_base: float = 10000000.0,
+        rope_scaling: Optional[dict] = None,
+):
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+
+    if rope_scaling is not None:
+        # We implement YARN(You Ain't RoPE Yet) scaling method
+        pass
+
+    t = torch.arange(max_position_embeddings, dtype=freqs.dtype)
+    # NOTE: outter?
+    freqs = torch.outer(t, freqs).float()  # [max_position_embeddings, dim/2]
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)  # [max_position_embeddings, dim]
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)  # [max_position_embeddings, dim]
+    return freqs_cos, freqs_sin
+
 class Attention(nn.Module):
     def __init__(self, config: LLMConfig):
         super().__init__()
@@ -217,3 +236,122 @@ class FeedForward(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
 
+class LLMBlock(nn.Module):
+    def __init__(self, config: LLMConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.self_attn = Attention(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+    
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+            past_key_value: Optional[Tuple[torch.Tensor]] = None,
+            use_cache: bool = False,
+            attention_mask: Optional[torch.Tensor] = None,
+    ):
+        residual = hidden_states
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings=position_embeddings,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            attention_mask=attention_mask,
+        )
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = residual + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states, present_key_value
+    
+class LLMModel(nn.Module):
+    def __init__(self, config: LLMConfig):
+        super().__init__()
+        self.config = config
+        self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([LLMBlock(config) for _ in range(config.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        freqs_cos, freqs_sin = precompute_freqs_cos_sin(
+            dim = config.hidden_size // config.num_attention_heads,
+            max_position_embeddings = config.max_position_embeddings,
+            rope_base = config.rope_theta,
+            rope_scaling = config.rope_scaling
+        )
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+
+    def forward(
+        self, 
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[List[Tuple[torch.Tensor]]] = None,
+        use_cache: bool = False,
+        **kwargs):
+        _, seq_len = input_ids.shape
+        if hasattr(past_key_values, "layers"): past_key_values = None
+
+        # NOTE: 通过设置past_key_values=[None]*num_layers来初始化缓存, 然后推理的时候迭代layer的时候传入。
+        past_key_values = past_key_values or [None] * self.num_hidden_layers
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+
+        # NOTE: input_ids to embeddings
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        position_embeddings = (
+            self.freqs_cos[start_pos:start_pos + seq_len],
+            self.freqs_sin[start_pos:start_pos + seq_len]
+        )
+
+        presents = []
+        for layer_idx, (layer, past_key_values) in enumerate(zip(self.layers, past_key_values)):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                past_key_value=past_key_values,
+                use_cache=use_cache,
+                attention_mask=attention_mask,
+            )
+            presents.append(present)
+        
+        hidden_states = self.norm(hidden_states)
+        return hidden_states, presents
+    
+class LLMForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = LLMConfig
+
+    def __init__(self, config: LLMConfig):
+        super().__init__(config)
+        self.model = LLMModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # NOTE: 在语言模型中, 通常会共享输入嵌入层(embed_tokens)和输出层(lm_head)的权重。
+        # 这种做法的主要目的是减少模型参数量, 同时提高模型的泛化能力。共享权重的假设是, 输入嵌入和输出嵌入在语义空间中应该是对称的。
+        self.model.embed_tokens.weight = self.lm_head.weight
+        self.out = CausalLMOutputWithPast()
+
+    def forward(self,
+                input_ids: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None,
+                past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                use_cache: bool = False,
+                logits_to_keep: Union[int, torch.Tensor] = 0,
+                **args):
+        h, past_kvs, aux_loss = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            **args
+        )
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(h[:, slice_indices, :])
+        self.OUT.__setitem__('last_hidden_state', h)
+        self.OUT.__setitem__('logits', logits)
+        self.OUT.__setitem__('aux_loss', aux_loss)
+        self.OUT.__setitem__('past_key_values', past_kvs)
+        return self.OUT
