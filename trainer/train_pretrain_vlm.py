@@ -10,7 +10,7 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
-
+from trainer.train_utils import init_distributed_mode, setup_seed
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="VLM-Pretrain")
@@ -40,8 +40,14 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # NOTE: 1. 初始化环境和随机种子
+    local_rank = init_distributed_mode()
+    if dist.is_initialized():
+        args.device = f"cuda:{local_rank}"
+    setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
+    print(f"=> Using device: {args.device}")
 
     # NOTE: 2. 配置目录、模型参数、检查ckpt
+    os.makedirs(args.save_dir, exist_ok=True)
 
     # NOTE: 3. 设置混合精度
 
