@@ -38,7 +38,12 @@ class VisionProj(nn.Module):
 class VLMModel(LLMForCausalLM):
     config_class = VLMConfig
 
-    def __init__(self, config: VLMConfig = None, vision_model_path: str = "openai/clip-vit-base-patch32", **kwargs):
+    def __init__(
+            self, 
+            config: VLMConfig = None, 
+            vision_model_path: str = "openai/clip-vit-base-patch32", 
+            **kwargs
+            ):
         super().__init__(config, **kwargs)
         self.config = config
         self.vision_encoder, self.processor = self.get_vision_model(vision_model_path)

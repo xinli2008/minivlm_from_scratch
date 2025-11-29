@@ -27,18 +27,18 @@ class LLMConfig(PretrainedConfig):
             num_key_value_heads: int=2,
             vocab_size: int=6400,
             rms_norm_eps: float=1e-6,
-            rope_theta: float=10000000.0,
+            rope_theta: float=1000000.0,
             inference_rope_scaling: bool=False,
             flash_attn: bool = True,
             # Add some specific configurations of MOE
-            use_moe: bool = False,              # 是否使用MoE
-            num_experts_per_tok: int = 2,       # 每个token使用的专家数量
-            n_routed_experts: int = 4,          # 路由的专家数量
-            n_shared_experts: int = 1,          # 共享的专家数量
-            scoring_func: str = "softmax",      # 路由评分函数
-            aux_loss_alpha: float = 0.1,        # 辅助损失的权重
-            seq_aux: bool = True,               # 是否使用序列辅助损失
-            norm_topk_probs: bool = True,       # 是否归一化top-k概率
+            use_moe: bool = False,              
+            num_experts_per_tok: int = 2,       
+            n_routed_experts: int = 4,          
+            n_shared_experts: int = 1,          
+            scoring_func: str = "softmax",      
+            aux_loss_alpha: float = 0.1,        
+            seq_aux: bool = True,               
+            norm_topk_prob: bool = True,       
             **kwargs,
     ):
         super().__init__(**kwargs)
@@ -69,16 +69,16 @@ class LLMConfig(PretrainedConfig):
         self.flash_attn = flash_attn
 
         # MOE configurations
-        self.use_moe = use_moe
-        self.num_experts_per_tok = num_experts_per_tok
-        self.n_routed_experts = n_routed_experts
-        self.n_shared_experts = n_shared_experts
-        self.scoring_func = scoring_func
-        self.aux_loss_alpha = aux_loss_alpha
-        self.seq_aux = seq_aux
-        self.norm_topk_probs = norm_topk_probs
+        self.use_moe = use_moe                            # 是否使用MOE
+        self.num_experts_per_tok = num_experts_per_tok    # 每个token使用的专家数量
+        self.n_routed_experts = n_routed_experts          # 路由的专家数量
+        self.n_shared_experts = n_shared_experts          # 共享的专家数量
+        self.scoring_func = scoring_func                  # 路由评分函数
+        self.aux_loss_alpha = aux_loss_alpha              # 辅助损失的权重
+        self.seq_aux = seq_aux                            # 是否使用序列辅助损失
+        self.norm_topk_prob = norm_topk_prob              # 是否归一化top-k概率
 
-class RMSNorm(torch.nn.Module):
+class RMSNorm(nn.Module):
     """
         RMSNorm implementation, Root Mean Square Layer Normalization, 均方根归一化.
         传统的LayerNorm是基于均值和标准差进行归一化的,而RMSNorm仅基于均方根进行归一化。
@@ -117,7 +117,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """重复Key或Value张量以匹配Query的头数"""
+    """重复Key或Value张量以匹配Query的头数, GQA的常见操作"""
     batch_size, n_heads, seq_len, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -174,7 +174,7 @@ class Attention(nn.Module):
             use_cache: bool = False,
             attention_mask: Optional[torch.Tensor] = None,
     ):
-        batch_size, seq_len, embed_dim = x.shape
+        batch_size, seq_len, _ = x.shape
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         xq = xq.view(batch_size, seq_len, self.n_local_heads, self.head_dim).transpose(1, 2)     # [batch_size, n_local_heads, seq_len, head_dim]
@@ -205,6 +205,7 @@ class Attention(nn.Module):
         else:
             # NOTE: 注意力机制的普通实现
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            # NOTE: scores + mask
             scores = scores + torch.tril(torch.full((seq_len, seq_len), float('-inf'), device=scores.device), diagonal=1).unsqueeze(0).unsqueeze(0)
         
             if attention_mask is not None:
@@ -253,7 +254,7 @@ class MoEGate(nn.Module):
         self.alpha = config.aux_loss_alpha
         self.seq_aux = config.seq_aux
 
-        self.norm_topk_probs = config.norm_topk_probs
+        self.norm_topk_prob = config.norm_topk_prob
         self.gating_dim = config.hidden_size
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim))) # [n_routed_experts, hidden_dim]
         self.reset_parameters()
@@ -277,7 +278,7 @@ class MoEGate(nn.Module):
         
         topk_weight, topk_idx = torch.topk(scores, self.top_k, dim=-1, sorted=False)
 
-        if self.top_k > 1 and self.norm_topk_probs:
+        if self.top_k > 1 and self.norm_topk_prob:
             # NOTE: 对top-k权重进行归一化处理, 使得它们的和为1
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
@@ -314,10 +315,10 @@ class MOEFeedForward(nn.Module):
         if config.n_shared_experts > 0:
             self.shared_experts = nn.ModuleList([FeedForward(config) for _ in range(config.n_shared_experts)])
     
-    def forward(self, hidden_states: torch.Tensor):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         identity = hidden_states
         original_shape = hidden_states.shape
-        batch_size, seq_len, hidden_dim = hidden_states.shape
+        _, _, hidden_dim = hidden_states.shape
 
         # NOTE: 使用门控网络获取top-k专家的权重和索引
         topk_weight, topk_idx, aux_loss = self.gate(hidden_states)
@@ -371,8 +372,8 @@ class LLMBlock(nn.Module):
             attention_mask=attention_mask,
         )
         hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = residual + self.mlp(self.post_attention_layernorm(hidden_states))
+        
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
     
 class LLMModel(nn.Module):
