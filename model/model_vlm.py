@@ -6,7 +6,9 @@ from typing import Optional, Tuple, List
 from torch import nn
 from transformers import CLIPProcessor, CLIPModel
 from typing import List
-from .model_llm import LLMConfig, LLMModel
+from .model_llm import LLMConfig, LLMModel, LLMForCausalLM
+from transformers import logging as hf_logging
+hf_logging.set_verbosity_error()
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -33,7 +35,7 @@ class VisionProj(nn.Module):
     def forward(self, x):
         return self.vision_proj(x)
 
-class VLMModel(LLMModel):
+class VLMModel(LLMForCausalLM):
     config_class = VLMConfig
 
     def __init__(self, config: VLMConfig = None, vision_model_path: str = "openai/clip-vit-base-patch32", **kwargs):
@@ -42,3 +44,98 @@ class VLMModel(LLMModel):
         self.vision_encoder, self.processor = self.get_vision_model(vision_model_path)
         self.vision_proj = VisionProj(llm_hidden_size=self.config.hidden_size)
 
+    def get_vision_model(self, vision_model_path: str):
+        if not os.path.exists(vision_model_path):
+            assert False, f"Vision model path {vision_model_path} does not exist."
+        
+        model = CLIPModel.from_pretrained(vision_model_path)
+        processor = CLIPProcessor.from_pretrained(vision_model_path)
+
+        # NOTE: Freeze vision encoder parameters
+        for param in model.parameters():
+            param.requires_grad = False
+
+        return model.eval(), processor
+
+    def image2tensor(self, image, processor):
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        inputs = processor(images=image, return_tensors="pt")["pixel_values"]
+        return inputs
+
+    def get_image_embeddings(self, image_tensor: torch.Tensor, vision_model):
+        with torch.no_grad():
+            # NOTE：在clip的模型, 第0个token是CLS, 后面的是patch embeddings, 所以取[:, 1:, :]
+            image_outputs = vision_model.vision_model(pixel_values=image_tensor).last_hidden_state[:, 1:, :].squeeze()
+        return image_outputs
+    
+    def merge_image_text_embeddings(self, tokens, h, vision_tensors=None):
+        """将视觉特征插入到文本特征中对应的位置"""
+        image_ids = torch.tensor(self.config.image_ids, device=tokens.device)
+        image_unique_id = image_ids[0]
+        mask = tokens == image_unique_id  # [B, seq_len]
+
+        if vision_tensors is None or not mask.any():
+            return h
+
+        vision_proj = self.vision_proj(vision_tensors)
+        vision_proj = vision_proj.squeeze(1)
+
+        # NOTE: 根据mask, 将视觉特征插入到文本特征中对应的位置
+        vision_proj = vision_proj.type_as(h) 
+        h = h.masked_scatter(mask.unsqueeze(-1), vision_proj)
+        return h
+
+    def forward(
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            past_key_values: Optional[List[Tuple[torch.Tensor]]] = None,
+            use_cache: bool = False,
+            logits_to_keep: int = 0,
+            pixel_values: Optional[torch.Tensor] = None,
+            **kwargs,
+            ):
+        _, seq_length = input_ids.shape
+        if hasattr(past_key_values, "layers"): past_key_values = None
+
+        # NOTE: 通过设置past_key_values=[None]*num_layers来初始化缓存, 然后推理的时候迭代layer的时候传入。
+        past_key_values = past_key_values or [None] * self.num_hidden_layers
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+
+        hidden_states = self.model.dropout(self.model.embed_tokens(input_ids))
+
+        if pixel_values is not None and start_pos == 0:
+            if len(pixel_values.shape) == 6:
+               pixel_values = pixel_values.squeeze(2)
+            bsz, num, _, _, _ = pixel_values.shape
+            stack_dim = 1 if bsz > 1 else 0
+            vision_tensors = torch.stack([
+                self.get_image_embeddings(pixel_values[:, i, :, :, :], self.vision_encoder)
+                for i in range(num)
+            ], dim=stack_dim)
+            hidden_states = self.merge_image_text_embeddings(input_ids, hidden_states, vision_tensors=vision_tensors)
+
+        position_embeddings = (
+        self.model.freqs_cos[start_pos:start_pos + seq_length],
+        self.model.freqs_sin[start_pos:start_pos + seq_length])
+
+        presents = []
+        for _, (layer, past_key_value) in enumerate(zip(self.model.layers, past_key_values)):
+            hidden_states, present = layer(
+                hidden_states,
+                position_embeddings,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                attention_mask=attention_mask
+            )
+            presents.append(present)
+
+        hidden_states = self.model.norm(hidden_states)
+
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        self.OUT.__setitem__('last_hidden_state', hidden_states)
+        self.OUT.__setitem__('logits', logits)
+        self.OUT.__setitem__('past_key_values', presents)
+        return self.OUT
