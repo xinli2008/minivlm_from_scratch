@@ -11,6 +11,11 @@ import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
+if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+    print("=> Flash Attention is available")
+else:
+    print("=> Flash Attention is NOT available")
+
 class LLMConfig(PretrainedConfig):
     model_type = "llm_model"
     def __init__(
@@ -164,7 +169,6 @@ class Attention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.dropout = config.dropout
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention") and config.flash_attn
-        print("=> Flash Attention Enabled" if self.flash else "Flash Attention Disabled")
 
     def forward(
             self,
