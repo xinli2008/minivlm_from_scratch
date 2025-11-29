@@ -6,7 +6,7 @@ from typing import Optional, Tuple, List
 from torch import nn
 from transformers import CLIPProcessor, CLIPModel
 from typing import List
-from .model_llm import LLMConfig, LLMModel, LLMForCausalLM
+from .model_llm import LLMConfig, LLMForCausalLM, MOEFeedForward, CausalLMOutputWithPast
 from transformers import logging as hf_logging
 hf_logging.set_verbosity_error()
 
@@ -133,9 +133,13 @@ class VLMModel(LLMForCausalLM):
 
         hidden_states = self.model.norm(hidden_states)
 
+        aux_loss = sum(
+            layer.mlp.aux_loss
+            for layer in self.model.layers
+            if isinstance(layer.mlp, MOEFeedForward)
+        )
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
-        self.OUT.__setitem__('last_hidden_state', hidden_states)
-        self.OUT.__setitem__('logits', logits)
-        self.OUT.__setitem__('past_key_values', presents)
-        return self.OUT
+        output = CausalLMOutputWithPast(logits=logits, past_key_values=presents, hidden_states=hidden_states)
+        output.aux_loss = aux_loss
+        return output

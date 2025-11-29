@@ -1,7 +1,7 @@
 import math
-from transformers import PretrainedConfig
 import torch
 import torch.nn as nn
+import torch.nn.init as init
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from typing import Optional, Tuple, List, Union
@@ -31,14 +31,14 @@ class LLMConfig(PretrainedConfig):
             inference_rope_scaling: bool=False,
             flash_attn: bool = True,
             # Add some specific configurations of MOE
-            use_moe: bool = False,
-            num_experts_per_tok: int = 2,
-            n_routed_experts: int = 4,
-            n_shared_experts: int = 1,
-            scoring_func: str = "softmax",
-            aux_loss_alpha: float = 0.1,
-            seq_aux: bool = True,
-            norm_topk_probs: bool = True,
+            use_moe: bool = False,              # 是否使用MoE
+            num_experts_per_tok: int = 2,       # 每个token使用的专家数量
+            n_routed_experts: int = 4,          # 路由的专家数量
+            n_shared_experts: int = 1,          # 共享的专家数量
+            scoring_func: str = "softmax",      # 路由评分函数
+            aux_loss_alpha: float = 0.1,        # 辅助损失的权重
+            seq_aux: bool = True,               # 是否使用序列辅助损失
+            norm_topk_probs: bool = True,       # 是否归一化top-k概率
             **kwargs,
     ):
         super().__init__(**kwargs)
@@ -58,6 +58,7 @@ class LLMConfig(PretrainedConfig):
         self.inference_rope_scaling = inference_rope_scaling
 
         # NOTE: 外推长度 = factor * original_max_position_embeddings
+        # video: https://www.bilibili.com/video/BV1T2k6BaEeC?spm_id_from=333.788.videopod.episodes&vd_source=634f9cd56b5b0cf10f6976238630bd8d&p=8
         self.rope_scaling = {
             "beta_fast": 4,
             "beta_slow": 1,
@@ -72,7 +73,7 @@ class LLMConfig(PretrainedConfig):
         self.num_experts_per_tok = num_experts_per_tok
         self.n_routed_experts = n_routed_experts
         self.n_shared_experts = n_shared_experts
-        self.scoring_function = scoring_func
+        self.scoring_func = scoring_func
         self.aux_loss_alpha = aux_loss_alpha
         self.seq_aux = seq_aux
         self.norm_topk_probs = norm_topk_probs
@@ -236,6 +237,114 @@ class FeedForward(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
 
+#########################################################################################################################################
+################################################################## MOE部分 ##############################################################
+# Video: https://www.bilibili.com/video/BV1GA43zNEAK/?spm_id_from=333.1007.top_right_bar_window_history.content.click&vd_source=634f9cd56b5b0cf10f6976238630bd8d
+
+class MoEGate(nn.Module):
+    """MOE门控网络, 路由器，负责将输入分配给不同的专家网络。"""
+    def __init__(self, config: LLMConfig):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+        
+        self.scoring_func = config.scoring_func
+        self.alpha = config.aux_loss_alpha
+        self.seq_aux = config.seq_aux
+
+        self.norm_topk_probs = config.norm_topk_probs
+        self.gating_dim = config.hidden_size
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim))) # [n_routed_experts, hidden_dim]
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+    
+    def forward(self, hidden_states: torch.Tensor):
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+        # NOTE: 将hidden_states转化为二维张量, 方便后面的矩阵乘法计算
+        hidden_states = hidden_states.view(-1, hidden_dim)  
+
+        # NOTE: F.linear(hidden_states, self.weight)的计算等价于hidden_states @ self.weight.T
+        # NOTE: hidden_states: [batch_size * seq_len, hidden_dim], weight: [n_routed_experts, hidden_dim]
+        # NOTE: logits: [batch_size * seq_len, n_routed_experts]
+        logits = F.linear(hidden_states, self.weight)
+        if self.scoring_func == "softmax":
+            scores = logits.softmax(dim=-1)
+        else:
+            raise NotImplementedError(f"Scoring function {self.scoring_func} not implemented.")
+        
+        topk_weight, topk_idx = torch.topk(scores, self.top_k, dim=-1, sorted=False)
+
+        if self.top_k > 1 and self.norm_topk_probs:
+            # NOTE: 对top-k权重进行归一化处理, 使得它们的和为1
+            denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            topk_weight = topk_weight / denominator
+
+        if self.training and self.alpha > 0.0:
+            # NOTE: 辅助负载均衡损失: 如果在训练模式下并且auxiliary loss的权重alpha大于0, 则计算辅助损失,用于鼓励路由器更均匀地分配输入到不同的专家网络。
+            scores_for_aux = scores
+            aux_topk = self.top_k
+            topk_idx_for_aux_loss = topk_idx.view(batch_size, -1)   # [batch_size, seq_len * top_k]
+            if self.seq_aux:
+                # NOTE: 序列辅助损失
+                scores_for_seq_aux = scores_for_aux.view(batch_size, seq_len, -1)
+                ce = torch.zeros(batch_size, self.n_routed_experts, device=hidden_states.device)
+                ce.scatter_add_(1, topk_idx_for_aux_loss,
+                                torch.ones(batch_size, seq_len * aux_topk, device=hidden_states.device)).div_(
+                    seq_len * aux_topk / self.n_routed_experts)
+                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
+            else:
+                mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                ce = mask_ce.float().mean(0)
+                Pi = scores_for_aux.mean(0)
+                fi = ce * self.n_routed_experts
+                aux_loss = (Pi * fi).sum() * self.alpha
+        else:
+            aux_loss = 0
+        return topk_weight, topk_idx, aux_loss
+
+class MOEFeedForward(nn.Module):
+    def __init__(self, config: LLMConfig):
+        super().__init__()
+        self.config = config
+        self.experts = nn.ModuleList([FeedForward(config) for _ in range(config.n_routed_experts)])
+        self.gate = MoEGate(config)
+        if config.n_shared_experts > 0:
+            self.shared_experts = nn.ModuleList([FeedForward(config) for _ in range(config.n_shared_experts)])
+    
+    def forward(self, hidden_states: torch.Tensor):
+        identity = hidden_states
+        original_shape = hidden_states.shape
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+
+        # NOTE: 使用门控网络获取top-k专家的权重和索引
+        topk_weight, topk_idx, aux_loss = self.gate(hidden_states)
+        hidden_states = hidden_states.view(-1, hidden_dim)  # [batch_size * seq_len, hidden_dim]
+        flatten_topk_idx = topk_idx.view(-1)  # [batch_size * seq_len * top_k]
+        
+        if self.training:
+            hidden_states = hidden_states.repeat_interleave(self.config.num_experts_per_tok, dim=0)  # [batch_size * seq_len * top_k, hidden_dim]
+            y = torch.empty_like(hidden_states)
+            for i, expert in enumerate(self.experts):
+                y[flatten_topk_idx == i] = expert(hidden_states[flatten_topk_idx == i]).type_as(y)
+            # NOTE： 将专家的输出根据top-k权重进行加权求和
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            y = y.view(*original_shape)
+        else:
+            pass
+        
+        # NOTE: 处理共享专家, 将共享专家的输出加到最终结果中
+        if self.config.n_shared_experts > 0:
+            for shared_expert in self.shared_experts:
+                y = y + shared_expert(identity)
+        
+        self.aux_loss = aux_loss
+        return y
+    
+#########################################################################################################################################
+
 class LLMBlock(nn.Module):
     def __init__(self, config: LLMConfig):
         super().__init__()
@@ -319,7 +428,14 @@ class LLMModel(nn.Module):
             presents.append(present)
         
         hidden_states = self.norm(hidden_states)
-        return hidden_states, presents
+
+        aux_loss = sum(
+            layer.mlp.aux_loss
+            for layer in self.layers
+            if isinstance(layer.mlp, MOEFeedForward)
+        )
+        
+        return hidden_states, presents, aux_loss
     
 class LLMForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = LLMConfig
@@ -341,7 +457,7 @@ class LLMForCausalLM(PreTrainedModel, GenerationMixin):
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
                 **args):
-        h, past_kvs, aux_loss = self.model(
+        hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -349,9 +465,7 @@ class LLMForCausalLM(PreTrainedModel, GenerationMixin):
             **args
         )
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(h[:, slice_indices, :])
-        self.OUT.__setitem__('last_hidden_state', h)
-        self.OUT.__setitem__('logits', logits)
-        self.OUT.__setitem__('aux_loss', aux_loss)
-        self.OUT.__setitem__('past_key_values', past_kvs)
-        return self.OUT
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        output = CausalLMOutputWithPast(logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
+        output.aux_loss = aux_loss
+        return output
