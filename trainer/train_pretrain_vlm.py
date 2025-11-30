@@ -14,6 +14,7 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer
+from dataset.vlm_dataset import VLMDataset
 from model.model_vlm import VLMConfig, VLMModel
 from trainer.train_utils import init_distributed_mode, setup_seed, is_main_process, Logger, init_vlm_model
 
@@ -62,7 +63,7 @@ if __name__ == "__main__":
     # NOTE: 2. 配置目录、模型参数、检查ckpt
     os.makedirs(args.save_dir, exist_ok=True)
     vlm_config = VLMConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, max_seq_len=args.max_seq_len, use_moe=bool(args.use_moe))
-    # ckpt_data = vlm_checkpoint(vlm_config, weight=args.save_weight, save_dir="../checkpoints") if args.from_resume==1 else None
+    ckpt_data = vlm_checkpoint(vlm_config, weight=args.save_weight, save_dir="../checkpoints") if args.from_resume==1 else None
 
     # NOTE: 3. 设置混合精度
     device_type = "cuda" if "cuda" in args.device else "cpu"
@@ -75,7 +76,7 @@ if __name__ == "__main__":
         import swanlab as wandb
         wandb_id = ckpt_data.get('wandb_id') if ckpt_data else None
         resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-V-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        wandb_run_name = f"miniVLM-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
 
     # NOTE: 5. 定义模型、数据、优化器
@@ -88,6 +89,16 @@ if __name__ == "__main__":
         device=args.device,
         freeze_llm=bool(args.freeze_llm),
     )
+    train_dataset = VLMDataset(
+        json_path=args.data_path,
+        images_path=args.images_path,
+        tokenizer=tokenizer,
+        preprocess=preprocess,
+        max_length=args.max_seq_len,
+    )
+    train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
+    scaler = torch.amp.GradScaler(enabled=(args.dtype == 'float16'))
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate)
 
     # NOTE: 6. 从ckpt恢复上次训练
 
