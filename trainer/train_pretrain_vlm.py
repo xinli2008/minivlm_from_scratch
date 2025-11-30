@@ -5,18 +5,15 @@ __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import argparse
-import time
-import warnings
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
 from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
-from transformers import AutoTokenizer
 from dataset.vlm_dataset import VLMDataset
-from model.model_vlm import VLMConfig, VLMModel
-from trainer.train_utils import init_distributed_mode, setup_seed, is_main_process, Logger, init_vlm_model
+from model.model_vlm import VLMConfig
+from trainer.train_utils import init_distributed_mode, setup_seed, is_main_process, Logger, init_vlm_model, SkipBatchSampler, vlm_checkpoint
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="VLM-Pretrain")
@@ -101,7 +98,30 @@ if __name__ == "__main__":
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate)
 
     # NOTE: 6. 从ckpt恢复上次训练
+    start_epoch, start_step = 0, 0
+    if ckpt_data:
+        model.load_state_dict(ckpt_data["model"], strict=False)
+        optimizer.load_state_dict(ckpt_data["optimizer"])
+        scaler.load_state_dict(ckpt_data["scaler"])
+        start_epoch = ckpt_data.get("epoch", 0)
+        start_step = ckpt_data.get("step", 0)
+        Logger(f"=> Resumed from checkpoint: epoch {start_epoch}, step {start_step}")
 
     # NOTE: 7. DDP封装模型
+    if dist.is_initialized():
+        model._ddp_params_and_buffers_to_ignore = {"pos_cis"}
+        model = DistributedDataParallel(model, device_ids=[local_rank])
 
     # NOTE: 8. 训练循环
+    for epoch in range(start_epoch, args.epochs):
+        train_sampler and train_sampler.set_epoch(epoch)
+        if epoch == start_epoch and start_step > 0:
+            # NOTE: 跳过已经训练过的steps
+            batch_sampler = SkipBatchSampler(train_sampler or range(len(train_dataset)), args.batch_size, start_step + 1)
+            loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=1, pin_memory=True)
+            Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
+            train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
+        else:
+            # NOTE: 从头开始训练
+            loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=1, pin_memory=True)
+            train_epoch(epoch, loader, len(loader), 0, wandb)

@@ -4,12 +4,12 @@
 
 import os
 import torch
-import torch.nn as nn
 import random
 import numpy as np
 import torch.distributed as dist
 from transformers import AutoTokenizer
-from model.model_vlm import VLMModel, VLMConfig
+from torch.utils.data import Sampler
+from model.model_vlm import VLMModel
 
 def init_distributed_mode():
     """ 初始化分布式训练环境, 返回当前进程的local_rank"""
@@ -65,3 +65,40 @@ def init_vlm_model(
         
     Logger(f'所加载VLM Model可训练参数：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     return model.to(device), tokenizer, model.processor
+
+class SkipBatchSampler(Sampler):
+    def __init__(self, sampler, batch_size, skip_batches=0):
+        self.sampler = sampler
+        self.batch_size = batch_size
+        self.skip_batches = skip_batches
+    
+    def __iter__(self):
+        batch = []
+        skipped = 0
+        for idx in self.sampler:
+            batch.append(idx)
+            if len(batch) == self.batch_size:
+                if skipped < self.skip_batches:
+                    skipped += 1
+                    batch = []
+                    continue
+                yield batch
+                batch = []
+        if len(batch) > 0 and skipped >= self.skip_batches:
+            yield batch
+    
+    def __len__(self):
+        total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
+        return max(0, total_batches - self.skip_batches)
+
+def vlm_checkpoint(
+        vlm_config,
+        weight="pretrain_vlm",
+        model=None,
+        optimizer=None,
+        epoch=0,
+        step=0,
+        wandb=None,
+        save_dir="../",
+        **kwargs):
+    pass
