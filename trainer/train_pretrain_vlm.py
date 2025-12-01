@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -13,7 +14,66 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from dataset.vlm_dataset import VLMDataset
 from model.model_vlm import VLMConfig
-from trainer.train_utils import init_distributed_mode, setup_seed, is_main_process, Logger, init_vlm_model, SkipBatchSampler, vlm_checkpoint
+from trainer.train_utils import init_distributed_mode, setup_seed, is_main_process, Logger, init_vlm_model, SkipBatchSampler, vlm_checkpoint, get_lr
+
+def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
+    loss_function = nn.CrossEntropyLoss(reduction='none')
+    start_time = time.time()
+
+    for step, (X, Y, loss_mask, pixel_values) in enumerate(dataloader, start=start_step+1):
+        x, y = x.to(args.device), y.to(args.device)
+        loss_mask, pixel_values = loss_mask.to(args.device), pixel_values.to(args.device)
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+        with autocast_ctx:
+            result = model(x, pixel_values=pixel_values)
+            loss = loss_function(result.logits.view(-1, result.logits.size(-1)), y.view(-1)).view(y.size())
+
+            loss = (loss * loss_mask).sum() / loss_mask.sum()
+            loss += result.aux_loss
+            loss = loss/ args.accumulation_steps
+        
+        scaler.scale(loss).backward()
+
+        if (step + 1) % args.accumulation_steps == 0:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+        
+        if step % args.log_interval == 0 or step == iters -1:
+            spend_time = time.time() - start_time
+            current_loss = loss.item() * args.accumulation_steps
+            current_lr = optimizer.param_groups[-1]['lr']
+            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            
+            Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:')
+            
+            if wandb: wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
+
+        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+            model.eval()
+            moe_suffix = '_moe' if vlm_config.use_moe else ''
+            ckp = f'{args.save_dir}/{args.save_weight}_{vlm_config.hidden_size}{moe_suffix}.pth'
+            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+                state_dict = model.module.state_dict()
+            else:
+                state_dict = model.state_dict()
+            clean_state_dict = {
+                key: value for key, value in state_dict.items() if not key.startswith('vision_encoder.')
+            }
+            clean_state_dict = {k: v.half().cpu() for k, v in clean_state_dict.items()}
+            torch.save(clean_state_dict, ckp)
+            vlm_checkpoint(vlm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
+                         epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
+            model.train()
+            del state_dict, clean_state_dict
+
+        del X, Y, loss_mask, pixel_values, res, loss
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="VLM-Pretrain")
