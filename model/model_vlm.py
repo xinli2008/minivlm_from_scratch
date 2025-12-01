@@ -57,6 +57,7 @@ class VLMModel(LLMForCausalLM):
         processor = CLIPProcessor.from_pretrained(vision_model_path)
 
         # NOTE: Freeze vision encoder parameters
+        # NOTE: clip模型本身在大规模的图文数据集上训练过, 输出的图片特征已经和文本特征对齐, 因此这里不需要再微调视觉编码器
         for param in model.parameters():
             param.requires_grad = False
 
