@@ -105,7 +105,7 @@ class VLMModel(LLMForCausalLM):
         if hasattr(past_key_values, "layers"): past_key_values = None
 
         # NOTE: 通过设置past_key_values=[None]*num_layers来初始化缓存, 然后推理的时候迭代layer的时候传入。
-        past_key_values = past_key_values or [None] * self.num_hidden_layers
+        past_key_values = past_key_values or [None] * self.config.num_hidden_layers
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
 
         hidden_states = self.model.dropout(self.model.embed_tokens(input_ids))

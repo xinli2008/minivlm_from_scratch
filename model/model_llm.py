@@ -123,10 +123,10 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """重复Key或Value张量以匹配Query的头数, GQA的常见操作"""
-    batch_size, n_heads, seq_len, head_dim = x.shape
+    batch_size, seq_len, n_heads, head_dim = x.shape
     if n_rep == 1:
         return x
-    x = x.unsqueeze(2).expand(batch_size, n_heads, n_rep, seq_len, head_dim).contiguous().view(batch_size, n_heads * n_rep, seq_len, head_dim)
+    x = x[:, :, :, None, :].expand(batch_size, seq_len, n_heads, n_rep, head_dim).contiguous().view(batch_size, n_heads * n_rep, seq_len, head_dim)
     return x
 
 def precompute_freqs_cos_sin(
@@ -181,21 +181,21 @@ class Attention(nn.Module):
         batch_size, seq_len, _ = x.shape
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
-        xq = xq.view(batch_size, seq_len, self.n_local_heads, self.head_dim).transpose(1, 2)     # [batch_size, n_local_heads, seq_len, head_dim]
-        xk = xk.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim).transpose(1, 2)  # [batch_size, n_local_kv_heads, seq_len, head_dim]
-        xv = xv.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim).transpose(1, 2)  # [batch_size, n_local_kv_heads, seq_len, head_dim]
+        xq = xq.view(batch_size, seq_len, self.n_local_heads, self.head_dim)     # [batch_size, n_local_heads, seq_len, head_dim]
+        xk = xk.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)  # [batch_size, n_local_kv_heads, seq_len, head_dim]
+        xv = xv.view(batch_size, seq_len, self.n_local_kv_heads, self.head_dim)  # [batch_size, n_local_kv_heads, seq_len, head_dim]
 
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
         # NOTE: kv_cache implementation
         if past_key_value is not None:
-            x_k = torch.cat([past_key_value[0], xk], dim=2)
-            x_v = torch.cat([past_key_value[1], xv], dim=2)
+            x_k = torch.cat([past_key_value[0], xk], dim=1)
+            x_v = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (x_k, x_v) if use_cache else None
 
         # NOTE: GQA implementation
-        xq, xk, xv = (xq, repeat_kv(xk, self.n_rep), repeat_kv(xv, self.n_rep))
+        xq, xk, xv = (xq.transpose(1,2), repeat_kv(xk, self.n_rep), repeat_kv(xv, self.n_rep))
 
         if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
             attention_mask = (
@@ -241,6 +241,7 @@ class FeedForward(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
+        return x
 
 #########################################################################################################################################
 ################################################################## MOE部分 ##############################################################
