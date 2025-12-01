@@ -6,7 +6,7 @@ import torch
 from model.model_vlm import VLMModel
 
 class VLMDataset(Dataset):
-    def __init__(self, json_path, images_path, tokenizer, preprocess=None, max_length=512, image_special_token="@"*196):
+    def __init__(self, json_path, images_path, tokenizer, preprocess=None, max_length=512, image_special_token="@"*196, vlm_model=None):
         super().__init__()
         self.samples = self.load_json(json_path)
         self.images_path = images_path
@@ -15,11 +15,13 @@ class VLMDataset(Dataset):
         self.max_length = max_length
         self.preprocess = preprocess
         self.image_token = image_special_token
+        self.vlm_model = vlm_model
 
         # NOTE: bos_id的作用是将<|im_start|>assistant这个特殊标记通过tokenizer转化为对应的token_id序列, 即整数序列。同理eos_id也是类似的作用。
         self.bos_id = tokenizer('<|im_start|>assistant', add_special_tokens=False).input_ids
         self.eos_id = tokenizer('<|im_end|>', add_special_tokens=False).input_ids
-    
+
+
     def __len__(self):
         return len(self.samples)
 
@@ -107,7 +109,7 @@ class VLMDataset(Dataset):
         for image_name in image_paths.split(','):
             image_name = image_name.strip()
             image = Image.open(f'{self.images_path}/{image_name}')
-            image_tensor = VLMModel.image2tensor(image, self.preprocess)
+            image_tensor = self.vlm_model.image2tensor(image, self.preprocess)
             image_tensors.append(image_tensor)
         image_tensors = torch.stack(image_tensors, dim=0)
 
