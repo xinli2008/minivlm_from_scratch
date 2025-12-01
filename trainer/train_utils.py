@@ -10,6 +10,7 @@ import torch.distributed as dist
 from transformers import AutoTokenizer
 from torch.utils.data import Sampler
 from model.model_vlm import VLMModel
+import math
 
 def init_distributed_mode():
     """ 初始化分布式训练环境, 返回当前进程的local_rank"""
@@ -63,7 +64,7 @@ def init_vlm_model(
                 param.requires_grad = False
         Logger("=> Freeze LLM model parameters.")
         
-    Logger(f'所加载VLM Model可训练参数：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
+    Logger(f'=> 所加载VLM Model可训练参数：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     return model.to(device), tokenizer, model.processor
 
 class SkipBatchSampler(Sampler):
@@ -90,6 +91,13 @@ class SkipBatchSampler(Sampler):
     def __len__(self):
         total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
         return max(0, total_batches - self.skip_batches)
+
+def get_lr(current_step, total_steps, lr):
+    """
+        学习率调度函数，采用余弦退火策略。
+        余弦退火策略主要是通过在训练过程中逐渐降低学习率，从而帮助模型更好地收敛，避免在训练后期出现震荡现象。
+    """
+    return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
 def vlm_checkpoint(
         vlm_config,
