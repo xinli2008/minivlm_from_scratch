@@ -36,6 +36,10 @@ cd pretrained_model && wget https://huggingface.co/jingyaogong/MiniMind2-V-PyTor
 cd model/vision_model && git clone https://huggingface.co/openai/clip-vit-base-patch16 && cd ../../
 ```
 
+## Architecture
 
-### Acknowledgements
+![VLM-architecture](./assets/VLM-structure.png)
+![VLM-architecture](./assets/VLM-structure-moe.png)
+
+## Acknowledgements
 1. our code is heavily inspired by [minimind-v](https://github.com/jingyaogong/minimind-v). Please refer to their repository for more details.
