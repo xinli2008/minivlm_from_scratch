@@ -1,6 +1,8 @@
 import os
 import sys
 import time
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -21,7 +23,7 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
     start_time = time.time()
 
     for step, (X, Y, loss_mask, pixel_values) in enumerate(dataloader, start=start_step+1):
-        x, y = x.to(args.device), y.to(args.device)
+        x, y = X.to(args.device), Y.to(args.device)
         loss_mask, pixel_values = loss_mask.to(args.device), pixel_values.to(args.device)
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
@@ -62,17 +64,16 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
                 state_dict = model.module.state_dict()
             else:
                 state_dict = model.state_dict()
-            clean_state_dict = {
-                key: value for key, value in state_dict.items() if not key.startswith('vision_encoder.')
-            }
+
+            # NOTE: 保存权重的时候去掉Clip视觉编码器部分，节省空间
+            clean_state_dict = {key: value for key, value in state_dict.items() if not key.startswith('vision_encoder.')}
             clean_state_dict = {k: v.half().cpu() for k, v in clean_state_dict.items()}
             torch.save(clean_state_dict, ckp)
-            vlm_checkpoint(vlm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
-                         epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
+            vlm_checkpoint(vlm_config, weight=args.save_weight, model=model, optimizer=optimizer, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
             model.train()
             del state_dict, clean_state_dict
 
-        del X, Y, loss_mask, pixel_values, res, loss
+        del X, Y, loss_mask, pixel_values, result, loss
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
@@ -88,7 +89,7 @@ if __name__ == "__main__":
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积的步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪的阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印的间隔步数")
-    parser.add_argument("--save_interval", type=int, default=100, help="模型保存的间隔步数")
+    parser.add_argument("--save_interval", type=int, default=10000, help="模型保存的间隔步数")
     parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层的大小")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层的数量")
     parser.add_argument('--max_seq_len', default=640, type=int, help="最大序列长度")
@@ -101,7 +102,7 @@ if __name__ == "__main__":
     # resume training args
     parser.add_argument('--from_weight', default='llm', type=str, help="加载的权重文件")
     parser.add_argument('--pretrained_model_folder_path', type=str, default="/home/lixin/workspace/personal_learning/minivlm_from_scratch/pretrained_model", help="预训练模型权重文件夹路径")
-    parser.add_argument('--from_resume', default=1, type=int, choices=[0, 1], help="是否从断点恢复（0表示否，1表示是）")
+    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否从断点恢复（0表示否，1表示是）")
     parser.add_argument('--freeze_llm', default=1, type=int, choices=[0, 1], help="是否冻结LLM权重（0表示否，1表示是）")
 
     # tokenizer and vision model paths
@@ -152,6 +153,7 @@ if __name__ == "__main__":
         tokenizer=tokenizer,
         preprocess=preprocess,
         max_length=args.max_seq_len,
+        vlm_model=model
     )
     train_sampler = DistributedSampler(train_dataset) if dist.is_initialized() else None
     scaler = torch.amp.GradScaler(enabled=(args.dtype == 'float16'))
@@ -179,9 +181,11 @@ if __name__ == "__main__":
             # NOTE: 跳过已经训练过的steps
             batch_sampler = SkipBatchSampler(train_sampler or range(len(train_dataset)), args.batch_size, start_step + 1)
             loader = DataLoader(train_dataset, batch_sampler=batch_sampler, num_workers=1, pin_memory=True)
-            Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
+            Logger(f'=> Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
         else:
             # NOTE: 从头开始训练
             loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=1, pin_memory=True)
             train_epoch(epoch, loader, len(loader), 0, wandb)
+    
+    Logger("=> Finish Training.")
