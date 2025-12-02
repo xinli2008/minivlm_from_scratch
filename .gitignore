@@ -214,3 +214,6 @@ pretrain_images
 sft_images
 pretrain_data.jsonl
 sft_data.jsonl
+output/*
+checkpoints/*
+*.pth
