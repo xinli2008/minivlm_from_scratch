@@ -76,20 +76,57 @@ class VLMModel(LLMForCausalLM):
         return image_outputs
     
     def merge_image_text_embeddings(self, tokens, h, vision_tensors=None):
-        """将视觉特征插入到文本特征中对应的位置"""
+        """
+            将视觉特征插入到文本特征中对应的位置, 替换掉图像占位符的token特征.
+            Args:
+                tokens: torch.Tensor, [B, seq_len]
+                h: torch.Tensor, [B, seq_len, hidden_size]
+                vision_tensors: torch.Tensor, [B, num_images, num_patches, vision_hidden_size]
+            Returns:
+                h: torch.Tensor, [B, seq_len, hidden_size]
+            NOTE: 在找mask的时候, 需要找到的是连续的196个图像占位符, 标记为Ture。如果有单独的位置也是图像占位符, 但是不连续, 则不进行替换.
+        """
+        if vision_tensors is None:
+            return h
+            
         image_ids = torch.tensor(self.config.image_ids, device=tokens.device)
         image_unique_id = image_ids[0]
+        num_image_tokens = len(self.config.image_ids)  # 196
+        
+        # 找到连续的图像占位符位置
         mask = tokens == image_unique_id  # [B, seq_len]
-
-        if vision_tensors is None or not mask.any():
+        
+        if not mask.any():
             return h
-
+        
+        # 处理每个batch
+        batch_size = tokens.shape[0]
         vision_proj = self.vision_proj(vision_tensors)
-        vision_proj = vision_proj.squeeze(1)
-
-        # NOTE: 根据mask, 将视觉特征插入到文本特征中对应的位置
-        vision_proj = vision_proj.type_as(h) 
-        h = h.masked_scatter(mask.unsqueeze(-1), vision_proj)
+        vision_proj = vision_proj.squeeze(1) if vision_proj.dim() > 3 else vision_proj
+        vision_proj = vision_proj.type_as(h)
+        
+        for b in range(batch_size):
+            batch_mask = mask[b]  # [seq_len]
+            if not batch_mask.any():
+                continue
+                
+            # 找到连续的196个True的起始位置
+            true_indices = torch.where(batch_mask)[0]
+            if len(true_indices) < num_image_tokens:
+                continue
+                
+            # 寻找连续的num_image_tokens个位置
+            for i in range(len(true_indices) - num_image_tokens + 1):
+                start_idx = true_indices[i]
+                end_idx = true_indices[i + num_image_tokens - 1]
+                
+                # 检查是否连续
+                if end_idx - start_idx == num_image_tokens - 1:
+                    # 找到连续的196个位置，替换这些位置的特征
+                    if b < vision_proj.shape[0]:
+                        h[b, start_idx:start_idx + num_image_tokens, :] = vision_proj[b]
+                    break
+        
         return h
 
     def forward(
