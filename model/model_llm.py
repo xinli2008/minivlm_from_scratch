@@ -126,7 +126,9 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch_size, seq_len, n_heads, head_dim = x.shape
     if n_rep == 1:
         return x
-    x = x[:, :, :, None, :].expand(batch_size, seq_len, n_heads, n_rep, head_dim).contiguous().view(batch_size, n_heads * n_rep, seq_len, head_dim)
+        
+    # NOTE: 最后reshape的时候,禁止reshape成[batch_size, n_heads * n_rep, seq_len, head_dim], 这会导致数据断开。
+    x = x[:, :, :, None, :].expand(batch_size, seq_len, n_heads, n_rep, head_dim).reshape(batch_size, seq_len, n_heads * n_rep, head_dim)
     return x
 
 def precompute_freqs_cos_sin(
@@ -195,7 +197,11 @@ class Attention(nn.Module):
         past_kv = (xk, xv) if use_cache else None
 
         # NOTE: GQA implementation
-        xq, xk, xv = (xq.transpose(1,2), repeat_kv(xk, self.n_rep), repeat_kv(xv, self.n_rep))
+        xq, xk, xv = (
+            xq.transpose(1, 2),
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2)
+        )
 
         if self.flash and seq_len > 1 and (attention_mask is None or torch.all(attention_mask == 1)):
             attention_mask = (
@@ -456,7 +462,6 @@ class LLMForCausalLM(PreTrainedModel, GenerationMixin):
         # NOTE: 在语言模型中, 通常会共享输入嵌入层(embed_tokens)和输出层(lm_head)的权重。
         # 这种做法的主要目的是减少模型参数量, 同时提高模型的泛化能力。共享权重的假设是, 输入嵌入和输出嵌入在语义空间中应该是对称的。
         self.model.embed_tokens.weight = self.lm_head.weight
-        self.out = CausalLMOutputWithPast()
 
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,

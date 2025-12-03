@@ -30,8 +30,10 @@ class VisionProj(nn.Module):
         super(VisionProj, self).__init__()
         self.vision_hidden_size = vision_hidden_size
         self.llm_hidden_size = llm_hidden_size
-        self.vision_proj = nn.Linear(vision_hidden_size, llm_hidden_size)
-    
+        self.vision_proj = nn.Sequential(
+            nn.Linear(vision_hidden_size, llm_hidden_size)
+        )
+
     def forward(self, x):
         return self.vision_proj(x)
 
@@ -60,7 +62,6 @@ class VLMModel(LLMForCausalLM):
         # NOTE: clip模型本身在大规模的图文数据集上训练过, 输出的图片特征已经和文本特征对齐, 因此这里不需要再微调视觉编码器
         for param in model.parameters():
             param.requires_grad = False
-
         return model.eval(), processor
 
     def image2tensor(self, image, processor):
