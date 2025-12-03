@@ -64,7 +64,7 @@ def init_vlm_model(
                 param.requires_grad = False
         Logger("=> Freeze LLM model parameters.")
         
-    Logger(f'=> 所加载VLM Model可训练参数：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
+    Logger(f'=> Trainable parameter in VLM is {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} million')
     return model.to(device), tokenizer, model.processor
 
 class SkipBatchSampler(Sampler):
