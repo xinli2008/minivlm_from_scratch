@@ -190,9 +190,9 @@ class Attention(nn.Module):
 
         # NOTE: kv_cache implementation
         if past_key_value is not None:
-            x_k = torch.cat([past_key_value[0], xk], dim=1)
-            x_v = torch.cat([past_key_value[1], xv], dim=1)
-        past_kv = (x_k, x_v) if use_cache else None
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None
 
         # NOTE: GQA implementation
         xq, xk, xv = (xq.transpose(1,2), repeat_kv(xk, self.n_rep), repeat_kv(xv, self.n_rep))
@@ -210,7 +210,9 @@ class Attention(nn.Module):
             # NOTE: 注意力机制的普通实现
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
             # NOTE: scores + mask
-            scores = scores + torch.tril(torch.full((seq_len, seq_len), float('-inf'), device=scores.device), diagonal=1).unsqueeze(0).unsqueeze(0)
+            # NOTE: triu: 对一个全为负无穷的矩阵应用上三角操作，保留主对角线以上一行的负无穷值，将其余部分设置为0
+            # NOTE: 最终效果是创建一个因果掩码，上三角部分为负无穷（阻止未来位置的注意力），下三角及对角线为0
+            scores = scores + torch.triu(torch.full((seq_len, seq_len), float('-inf'), device=scores.device), diagonal=1).unsqueeze(0).unsqueeze(0)
         
             if attention_mask is not None:
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
