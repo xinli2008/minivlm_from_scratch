@@ -48,5 +48,11 @@ cd model/vision_model && git clone https://huggingface.co/openai/clip-vit-base-p
 python3 train_pretrain_vlm.py --epochs 10 --batch_size 64 --hidden_states 512 --from_weight llm --freeze_llm 1 
 ```
 
+## Test
+
+```bash
+python3 eval.py --load_from model --image_dir ./dataset/eval_images --top_p 0.85 --temperature 0.65
+```
+
 ## Acknowledgements
 1. our code is heavily inspired by [minimind-v](https://github.com/jingyaogong/minimind-v). Please refer to their repository for more details.
