@@ -41,5 +41,12 @@ cd model/vision_model && git clone https://huggingface.co/openai/clip-vit-base-p
 ![VLM-architecture](./assets/VLM-structure.png)
 ![VLM-architecture](./assets/VLM-structure-moe.png)
 
+## Training
+
+### Pretraining
+```bash
+python3 train_pretrain_vlm.py --epochs 10 --batch_size 64 --hidden_states 512 --from_weight llm --freeze_llm 1 
+```
+
 ## Acknowledgements
 1. our code is heavily inspired by [minimind-v](https://github.com/jingyaogong/minimind-v). Please refer to their repository for more details.
