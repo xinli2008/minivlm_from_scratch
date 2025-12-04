@@ -59,7 +59,7 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if vlm_config.use_moe else ''
-            ckp = f'{args.save_dir}/{args.save_weight}_{vlm_config.hidden_size}{moe_suffix}.pth'
+            ckp = f'{args.save_dir}/{args.save_weight}_{vlm_config.hidden_size}{moe_suffix}_epoch{epoch}_iter{step}.pth'
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
             else:
@@ -78,10 +78,10 @@ def train_epoch(epoch, dataloader, iters, start_step=0, wandb=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="VLM-Pretrain")
-    parser.add_argument("--save_dir", type=str, default="./output", help="保存模型的目录")
+    parser.add_argument("--save_dir", type=str, default="../output", help="保存模型的目录")
     parser.add_argument("--save_weight", default="pretrain_vlm", type=str, help="保存的权重文件名")
     parser.add_argument("--epochs", type=int, default=10, help="训练的轮数")
-    parser.add_argument("--batch_size", type=int, default=16, help="每批次的样本数量")
+    parser.add_argument("--batch_size", type=int, default=64, help="每批次的样本数量")
     parser.add_argument("--learning_rate", type=float, default=4e-4, help="学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备，例如cuda:0或cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="数据类型，例如bfloat16")
@@ -89,25 +89,25 @@ if __name__ == "__main__":
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积的步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪的阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印的间隔步数")
-    parser.add_argument("--save_interval", type=int, default=10000, help="模型保存的间隔步数")
+    parser.add_argument("--save_interval", type=int, default=3000, help="模型保存的间隔步数")
     parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层的大小")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层的数量")
     parser.add_argument('--max_seq_len', default=640, type=int, help="最大序列长度")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE（0表示否，1表示是）")
-    parser.add_argument("--data_path", type=str, default="/home/lixin/workspace/personal_learning/minivlm_from_scratch/dataset/pretrain_data.jsonl", help="预训练数据的路径")
-    parser.add_argument("--images_path", type=str, default="/home/lixin/workspace/personal_learning/minivlm_from_scratch/dataset/pretrain_images", help="预训练图像的路径")
+    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_data.jsonl", help="预训练数据的路径")
+    parser.add_argument("--images_path", type=str, default="../dataset/pretrain_images", help="预训练图像的路径")
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb进行日志记录")
     parser.add_argument("--wandb_project", type=str, default="VLM-Pretrain", help="wandb项目名称")
 
     # resume training args
     parser.add_argument('--from_weight', default='llm', type=str, help="加载的权重文件")
-    parser.add_argument('--pretrained_model_folder_path', type=str, default="/home/lixin/workspace/personal_learning/minivlm_from_scratch/pretrained_model", help="预训练模型权重文件夹路径")
+    parser.add_argument('--pretrained_model_folder_path', type=str, default="../pretrained_model", help="预训练模型权重文件夹路径")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否从断点恢复（0表示否，1表示是）")
     parser.add_argument('--freeze_llm', default=1, type=int, choices=[0, 1], help="是否冻结LLM权重（0表示否，1表示是）")
 
     # tokenizer and vision model paths
-    parser.add_argument('--tokenizer_path', type=str, default="/home/lixin/workspace/personal_learning/minivlm_from_scratch/model", help="分词器预训练模型路径")
-    parser.add_argument('--vision_model_path', type=str, default="/home/lixin/workspace/personal_learning/minivlm_from_scratch/model/vision_model/clip-vit-base-patch16", help="视觉模型预训练模型路径")
+    parser.add_argument('--tokenizer_path', type=str, default="../model", help="分词器预训练模型路径")
+    parser.add_argument('--vision_model_path', type=str, default="../model/vision_model/clip-vit-base-patch16", help="视觉模型预训练模型路径")
 
     args = parser.parse_args()
 
@@ -185,7 +185,7 @@ if __name__ == "__main__":
             train_epoch(epoch, loader, len(loader) + start_step + 1, start_step, wandb)
         else:
             # NOTE: 从头开始训练
-            loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=1, pin_memory=True)
+            loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
             train_epoch(epoch, loader, len(loader), 0, wandb)
     
     Logger("=> Finish Training.")
