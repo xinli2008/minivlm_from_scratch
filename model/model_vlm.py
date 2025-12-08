@@ -170,7 +170,8 @@ class VLMModel(LLMForCausalLM):
                 hidden_states,
                 position_embeddings,
                 past_key_value=past_key_value,
-                use_cache=use_cache,
+                # NOTE: 训练时整个序列同时输入，所有位置的attention分数可以并行计算,不需要kv_cache。而推理时是逐步生成的,需要缓存之前的key和value。
+                use_cache=use_cache,    
                 attention_mask=attention_mask
             )
             presents.append(present)
