@@ -214,6 +214,8 @@ class Attention(nn.Module):
             output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=attention_mask, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
             # NOTE: 注意力机制的普通实现
+            # NOTE: /sqrt(head_dim)是为了防止点积结果过大, 导致softmax函数的梯度消失问题。另外, Q和K.T相乘的方差是d_k，然后除以sqrt(d_k)可以使得Q*K.T的方差为1，从而稳定训练过程。
+            # 如果直接除以d_k的话，方差会变得比较小，注意力值之间的差异不突出，差异化体现不明显。
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
             # NOTE: scores + mask
             # NOTE: triu: 对一个全为负无穷的矩阵应用上三角操作，保留主对角线以上一行的负无穷值，将其余部分设置为0
