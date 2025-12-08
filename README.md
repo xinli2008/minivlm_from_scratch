@@ -48,6 +48,11 @@ cd model/vision_model && git clone https://huggingface.co/openai/clip-vit-base-p
 python3 train_pretrain_vlm.py --epochs 10 --batch_size 64 --hidden_states 512 --from_weight llm --freeze_llm 1 
 ```
 
+### SFT_training
+```bash
+python3 train_sft_vlm.py --epochs 5 --batch_size 32 --hidden_states 512 --from_weight pretrain_vlm --freeze_llm 0 
+```
+
 ## Test
 
 ```bash
