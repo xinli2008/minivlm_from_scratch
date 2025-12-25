@@ -32,7 +32,7 @@ unzip sft_images.zip && rm sft_images.zip
 ### Pretrained Weights
 
 ```bash
-cd pretrained_model && wget https://huggingface.co/jingyaogong/MiniMind2-V-PyTorch/blob/main/llm_512.pth && cd ..
+cd pretrained_model && wget https://huggingface.co/jingyaogong/MiniMind2-V-PyTorch/resolve/main/llm_512.pth && cd ..
 cd model/vision_model && git clone https://huggingface.co/openai/clip-vit-base-patch16 && cd ../../
 ```
 
